@@ -230,9 +230,6 @@ sub mickles_pickles {
 	$channels   //= "None";
 	$registered //= 0;
 
-	foreach
-	
-
 	if (settings_get_str('track_raw_enable')) {
 	    open(my $fh2, '<',  $track_file);
 	    my @list = <$fh2>;
@@ -264,8 +261,8 @@ sub mickles_pickles {
 	if (settings_get_bool('track_sql_enable')) {
 		my $unique_id = get_unique_id($nick, $ident, $mask);
 		my $exists;
-		my $servers = $server->real_address;
-
+		#		my $servers = Irssi::active_server->{real_address};
+		# TODO: Once figured out how to pull channels, add in new table insert for chan/serv
 		$sth = $dbh->prepare("SELECT `unique_id` FROM $sql_table WHERE unique_id = ?")
 			or die("Unable to prepare statement: " . $dbh->errstr);
 		$sth->execute($unique_id);
@@ -274,29 +271,33 @@ sub mickles_pickles {
 		if (!$result[0]) {
 			$sth = $dbh->prepare(qq/
 					INSERT INTO `$sql_table` (
-						nickname,             ident,  hostname,
-						date_first_seen,       date_last_seen, real_name,
-				     registered, date_registered,       bot,
-						channels,           servers, unique_id
-					) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)/)
+						       nickname,           ident,  hostname,
+						date_first_seen,  date_last_seen, real_name,
+				             registered, date_registered,       bot,
+							 unique_id
+					) VALUES (?,?,?,?,?,?,?,?,?,?)/)
 				or warn "Can't prepare statement: $! ($@) $dbh->errstr;";
 
 			$sth->execute($nick, $ident, $mask,
 						  get_sql_time(), get_sql_time(), $real_name,
 						  $registered, get_sql_time(), 0,
-						  '', $servers, $unique_id)
+						  $unique_id)
 				or warn "Sry m8 no go: $! ($@) $dbh->errstr";
 		} else {
-			$sth = $dbh->prepare("UPDATE `$sql_table` SET date_last_seen = ?, real_name = ?, channels = ?, servers = ? WHERE unique_id = ?");
-			$sth->execute(get_sql_time(), $real_name, $channels, $servers, $unique_id); 
+			$sth = $dbh->prepare("UPDATE `$sql_table` SET date_last_seen = ?, real_name = ?  WHERE unique_id = ?");
+			$sth->execute(get_sql_time(), $real_name, $unique_id); 
 				#TODO: Quieter way to collect channels
 		}
 	}
 }
 
 sub get_unique_id {
-	my ($unick, $ident, $host) = @_;
-    return encode_base64($unick . ":" . $ident . ":" . $host);
+	my ($unick, $ident, $host, $server, $channel) = @_;
+
+	if ($server and $channel) {
+		return encode_base64("$unick:$ident:$host:$server:$channel");
+	}
+	return encode_base64("$unick:$ident:$host");
 }
 
 
@@ -329,10 +330,7 @@ sub track {
 	}
 
 	if ($type eq "debug") {
-		foreach my $serv (Irssi::servers()) {
-			Irssi::print("%Y" . Dumper($serv));
-		}
-		Irssi::print("Here too: " . Irssi::active_server());
+		Irssi::print("Here too: " . Irssi::active_server->{real_address});
 	}
 
     if ($type eq "count") {
@@ -403,39 +401,35 @@ sub namechan {
     foreach my $serv (Irssi::channels()) {
 		Irssi::print("%R================%N");
         my $curserv = $serv->{server}->{tag};
-        if ($active_server->{tag} eq $curserv) {
-			$sth = $dbh->prepare("UPDATE `$sql_table` SET date_last_seen = ?, real_name = ?, servers = ? WHERE unique_id = ?");
-            foreach my $nname ($serv->nicks()) {
-                my $unick = conv($nname->{nick});
-                open(my $fh, '<', $track_file);
-                my @list = <$fh>;
-                close($fh);
-				my $real_name = $nname->{realname};
-				my @temp  = split("@", $nname->{host});
-				my $ident = $temp[0];
-				my $host  = $temp[1];
-				my $unique_id = get_unique_id($unick, $ident, $host);
-				my $servers = $active_server->real_address;
-				$ident    =~ s/^~//;
-				$real_name =~ s/[^ -~]//g; # clear all non-printable characters
+		$sth = $dbh->prepare("UPDATE `$sql_table` SET date_last_seen = ?, real_name = ?, servers = ? WHERE unique_id = ?");
+		foreach my $nname ($serv->nicks()) {
+			my $unick = conv($nname->{nick});
+			open(my $fh, '<', $track_file);
+			my @list = <$fh>;
+			close($fh);
+			my $real_name = $nname->{realname};
+			my @temp  = split("@", $nname->{host});
+			my $ident = $temp[0];
+			my $host  = $temp[1];
+			my $unique_id = get_unique_id($unick, $ident, $host);
+			my $servers = Irssi::active_server->{real_address};
+			$ident    =~ s/^~//;
+			$real_name =~ s/[^ -~]//g; # clear all non-printable characters
 
-				Irssi::print("%R", Dumper($nname));
-
-                if (!grep(/$unick;$ident;$host/, @list)) {
-                    Irssi::active_server->send_raw("WHOIS " . $nick);
-                    $count++;
-					# TODO: Maybe sleep? This can really lock the client up
-					#		as well as probably make some sysops mad
-					#		fuck it, #getrekt
-                } else {
-					if (settings_get_bool('track_sql_enable')) {
-						$sth->execute(get_sql_time(), $real_name, $servers, $unique_id);
-					}
-                    Irssi::print("%RAlready gathered $unick") if !$quiet_mode;
-                }
-            }
-        }
-    }
+			if (!grep(/$unick;$ident;$host/, @list)) {
+				Irssi::active_server->send_raw("WHOIS " . $unick);
+				$count++;
+				# TODO: Maybe sleep? This can really lock the client up
+				#		as well as probably make some sysops mad
+				#		fuck it, #getrekt
+			} else {
+				if (settings_get_bool('track_sql_enable')) {
+					$sth->execute(get_sql_time(), $real_name, $servers, $unique_id);
+				}
+				Irssi::print("%RAlready gathered $unick") if !$quiet_mode;
+			}
+		}
+	}
     Irssi::print("%GGathering complete - Added $count new entries");
 }
 
