@@ -275,7 +275,7 @@ sub mickles_pickles {
 			$sth = $dbh->prepare(qq/
 					INSERT INTO `$sql_table` (
 						nickname,             ident,  hostname,
-						first_seen,       last_seen, real_name,
+						date_first_seen,       date_last_seen, real_name,
 				     registered, date_registered,       bot,
 						channels,           servers, unique_id
 					) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)/)
@@ -287,7 +287,7 @@ sub mickles_pickles {
 						  '', $servers, $unique_id)
 				or warn "Sry m8 no go: $! ($@) $dbh->errstr";
 		} else {
-			$sth = $dbh->prepare("UPDATE `$sql_table` SET last_seen = ?, real_name = ?, channels = ?, servers = ? WHERE unique_id = ?");
+			$sth = $dbh->prepare("UPDATE `$sql_table` SET date_last_seen = ?, real_name = ?, channels = ?, servers = ? WHERE unique_id = ?");
 			$sth->execute(get_sql_time(), $real_name, $channels, $servers, $unique_id); 
 				#TODO: Quieter way to collect channels
 		}
@@ -404,7 +404,7 @@ sub namechan {
 		Irssi::print("%R================%N");
         my $curserv = $serv->{server}->{tag};
         if ($active_server->{tag} eq $curserv) {
-			$sth = $dbh->prepare("UPDATE `$sql_table` SET last_seen = ?, real_name = ?, servers = ? WHERE unique_id = ?");
+			$sth = $dbh->prepare("UPDATE `$sql_table` SET date_last_seen = ?, real_name = ?, servers = ? WHERE unique_id = ?");
             foreach my $nname ($serv->nicks()) {
                 my $unick = conv($nname->{nick});
                 open(my $fh, '<', $track_file);
@@ -506,9 +506,7 @@ sub importAKA {
 
 sub sql_init {
 	my $create_database = "CREATE DATABASE IF NOT EXISTS `$sql_db`;";
-    my $create_main_table =
-		qq/
-		CREATE TABLE IF NOT EXISTS `$sql_table` (
+    my $create_main_table =	"CREATE TABLE IF NOT EXISTS `$sql_table` (
 			    `id` int(9) NOT NULL AUTO_INCREMENT,
 				`nickname` varchar(255) CHARACTER SET utf8 NOT NULL,
 			  	`ident` varchar(255) CHARACTER SET utf8 NOT NULL,
@@ -534,7 +532,7 @@ sub sql_init {
 				`unique_data_id` varchar(255) NOT NULL COMMENT 'users unique id with chan/serv',
 			PRIMARY KEY (`id`),
 			UNIQUE KEY `UNIQUE` (`unique_data_id`)
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;/;
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
 			
 	chomp(my $t_out = `mysql -e 'SELECT * FROM mysql.user' -u $sql_user -p'$sql_pass' 2>&1`);
 	
@@ -553,6 +551,7 @@ sub sql_init {
 
 		chomp($t_out = `mysql -e 'use "$sql_db"; 
 			GRANT ALL PRIVILEGES ON $sql_table.* TO "$sql_user"@"$sql_host" IDENTIFIED BY "$sql_pass";
+			GRANT ALL PRIVILEGES ON track_data.* TO "$sql_user"@"$sql_host" IDENTIFIED BY "$sql_pass";
 			FLUSH PRIVILEGES;' 2>&1`);
 		$t_out = "%GGood%N" if length $t_out < 3;
 		Irssi::print("%YPrivilege creation result: $t_out");
@@ -641,20 +640,19 @@ sub raw_to_sql {
 	my @list = <$fh>;
 	close $fh;
 
-	my $sth = $dbh->prepare("INSERT INTO $sql_table (nickname, ident, hostname, first_seen, last_seen, real_name, registered, date_registered, channels, servers, bot, unique_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+	my $sth = $dbh->prepare("INSERT INTO $sql_table (nickname, ident, hostname, date_first_seen, date_last_seen, real_name, registered, channels, servers, bot, unique_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 		or warn "Can't prepare statement: $! ($dbh->errstr)";	
 
 	foreach my $entry (@list) {
 		my ($unick, $ident, $host)   = split(';', $entry);
-		my ($first_seen, $last_seen) = (get_sql_time(), get_sql_time());
+		my ($date_first_seen, $date_last_seen) = (get_sql_time(), get_sql_time());
 		my ($registered, $bot)       = (0, 0);
 		my $real_name                = "IMPORTED";
-		my $date_registered          = get_sql_time();
 		my $channels                 = "";
 		my $servers                  = "";
 		my $unique_id                = get_unique_id($unick, $ident, $host);
 
-		$sth->execute($unick, $ident, $host, $first_seen, $last_seen, $real_name, $registered, $date_registered, $channels, $servers, $bot, $unique_id)
+		$sth->execute($unick, $ident, $host, $date_first_seen, $date_last_seen, $real_name, $registered, $channels, $servers, $bot, $unique_id)
 			or warn "Can't execute prepared statement: $! ($dbh->errstr)";
 	}
 }
@@ -662,7 +660,7 @@ sub raw_to_sql {
 sub notice {
 	my ($server, $message, $sender, $sender_hostname, $recipient) = @_;
 	my $time_registered;
-	my $last_seen;
+	my $date_last_seen;
 	my $unick = $active_nick;
 
 	my %months = (
@@ -692,7 +690,7 @@ sub notice {
 
 	if ($message =~ /Last seen time\W*: (\w+) (?<day>\d+)-(?<month>\w+)-(?<year>\d+) (?<hour>\d+):(?<min>\d+):(?<sec>\d+) GMT/) {
 		my $datetime   = $+{year} . "-" . $months{$+{month}} . "-" . $+{day} . " " . $+{hour} . ":" . $+{min} . ":" . $+{sec};
-		my $sth = $dbh->prepare("UPDATE $sql_table SET `last_seen` = ? WHERE `nickname` = ?");
+		my $sth = $dbh->prepare("UPDATE $sql_table SET `date_last_seen` = ? WHERE `nickname` = ?");
 		$sth->execute($datetime, $unick);
 		$unick = "None";
 	}
