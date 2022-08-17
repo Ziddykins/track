@@ -307,10 +307,10 @@ sub mickles_pickles {
 }
 
 sub get_unique_id {
-    my ($unick, $ident, $host, $server, $channel) = @_;
+    my ($unick, $ident, $host, $channel) = @_;
 
     if ($server and $channel) {
-        return encode_base64("$unick:$ident:$host:$server:$channel");
+        return encode_base64("$unick:$ident:$host:$channel");
     }
     return encode_base64("$unick:$ident:$host");
 }
@@ -702,10 +702,13 @@ sub process_chans {
 		
 		foreach my $channel (@chansplit) {
 			my $temp = decode_base64($active_uid);
-			Irssi::print("%BDebug - Current uid decoded = $temp");
-			my @spl2 = split(/:/, $temp);
-			my ($unick, $ident, $host) = ($spl2[0], $spl[1], $spl[2]);
-			my $unique_data_id = get_unique_id("$unick:$ident:$host:$server_real_address:$channel");
+			my ($unick, $ident, $host);
+			if ($temp =~ /(.*?):(.*?):(.*)/) {
+				$unick = $1;
+				$ident = $2;
+				$host  = $3;
+			}
+			my $unique_data_id = get_unique_id($unick, $ident, $host, $channel);
 			my $sth = $dbh->prepare("SELECT `unique_id`,`unique_data_id` FROM track_data WHERE unique_data_id = ?")
 				or die("Unable to prepare statement: " . $dbh->errstr);
 			$sth->execute($unique_data_id);
