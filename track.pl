@@ -43,7 +43,7 @@ my $active_server;
 my $active_nick;
 my $active_uid;
 my ($sql_host, $sql_pass, $sql_user, $sql_table, $sql_port, $sql_db);
-my ($dbh, $sth);
+my $dbh;
 
 sub init {
     my $connect_msg;
@@ -52,14 +52,15 @@ sub init {
     settings_add_bool('track', 'track_quiet',      0);
     settings_add_bool('track', 'track_sql_enable', 0);
     settings_add_bool('track', 'track_raw_enable', 0);
-    settings_add_str('track', 'track_file',
-        Irssi::get_irssi_dir() . '/track.lst');
     settings_add_str('track', 'track_sql_host',  '');
     settings_add_str('track', 'track_sql_user',  '');
     settings_add_str('track', 'track_sql_pass',  '');
     settings_add_str('track', 'track_sql_port',  '');
     settings_add_str('track', 'track_sql_table', '');
     settings_add_str('track', 'track_sql_db',    '');
+    settings_add_str('track', 'track_file',
+        Irssi::get_irssi_dir() . '/track.lst');
+
 
     $track_file = settings_get_str('track_file');
 
@@ -93,8 +94,9 @@ sub init {
     if (settings_get_str('track_sql_enable')) {
         if (check_sql_info()) {
             sql_init();
-            $sth      = $dbh->prepare("SELECT COUNT(*) FROM $sql_table;");
-            $db_count = $sth->execute;
+            my $sth   = $dbh->prepare("SELECT COUNT(*) FROM $sql_table;");
+            $sth->execute;
+            $db_count = $sth->fetchrow();
         }
     } else {
         Irssi::print("%RSQL mode not active");
@@ -163,7 +165,7 @@ sub whois_signal {
     my $unique_id  = get_unique_id($nick, $ident, $host);
     my $chans;
     $active_server = $server;
-	$active_uid    = $unique_id;
+    $active_uid    = $unique_id;
     $nick = conv($nick);
     $ident =~ s/^~//;
     $ident = conv($ident);
@@ -184,7 +186,7 @@ sub whois_signal {
 
     if ($data =~ /channels/) {
         my ($unused, $channels) = split($data, ':');
-        $sth =
+        my $sth =
           $dbh->prepare("SELECT `channels` FROM $sql_table WHERE unique_id = ?")
           or die("Unable to prepare statement: " . $dbh->errstr);
         $sth->execute($unique_id);
@@ -269,10 +271,8 @@ sub mickles_pickles {
     if (settings_get_bool('track_sql_enable')) {
         my $unique_id = get_unique_id($nick, $ident, $mask);
         my $exists;
-
-#		my $servers = Irssi::active_server->{real_address};
-# TODO: Once figured out how to pull channels, add in new table insert for chan/serv
-        $sth = $dbh->prepare(
+        
+        my $sth = $dbh->prepare(
             "SELECT `unique_id` FROM $sql_table WHERE unique_id = ?")
           or die("Unable to prepare statement: " . $dbh->errstr);
         $sth->execute($unique_id);
@@ -281,11 +281,11 @@ sub mickles_pickles {
         if (!$result[0]) {
             $sth = $dbh->prepare(
                 qq/
-				INSERT INTO `$sql_table` (
-				nickname,           ident,  hostname,
-				date_first_seen,  date_last_seen, real_name,
-				registered,             bot, unique_id
-				) VALUES (?,?,?,?,?,?,?,?,?)/
+                INSERT INTO `$sql_table` (
+                nickname,           ident,  hostname,
+                date_first_seen,  date_last_seen, real_name,
+                registered,             bot, unique_id
+                ) VALUES (?,?,?,?,?,?,?,?,?)/
             ) or warn "Can't prepare statement: $! ($@) $dbh->errstr;";
 
             $sth->execute(
@@ -309,14 +309,13 @@ sub mickles_pickles {
 sub get_unique_id {
     my ($unick, $ident, $host, $channel) = @_;
 
-    if ($server and $channel) {
+    if ($channel) {
         return encode_base64("$unick:$ident:$host:$channel");
     }
     return encode_base64("$unick:$ident:$host");
 }
 
 sub track {
-    my @list = <$track_fh>;
     my $match;
     my $input = $_[0];
     chomp($input);
@@ -348,8 +347,20 @@ sub track {
     }
 
     if ($type eq "count") {
-        Irssi::print("%GDatabase entries%n: " . scalar(@list));
-        return;
+        my $which = $spl[1];
+        $which //= "raw";
+        if ($which eq "raw") {
+            open my $fh, '<', settings_get_str("track_file");
+            my @tmp = <$fh>;
+            close $fh;
+            Irssi::print("%GRaw Database Entries%N: " . scalar(@tmp));
+        } elsif ($which eq "sql") {
+            my $sth = $dbh->prepare("SELECT COUNT(*) FROM $sql_table");
+            $sth->execute();
+            my $dbcount = $sth->fetchrow();
+            Irssi::print("%GSQL Database Entries%N: $dbcount");
+        }
+       return; 
     } elsif ($type eq "quiet") {
         $quiet_mode = $quiet_mode ? 0 : 1;
         Irssi::print("%GQuiet mode set to $quiet_mode");
@@ -419,11 +430,10 @@ sub uniq {
 
 sub namechan {
     my $count = 0;
-    Irssi::print("%ROMG DEBUG");
+    
     foreach my $serv (Irssi::channels()) {
-        Irssi::print("%R================%N");
         my $curserv = $serv->{server}->{tag};
-        $sth = $dbh->prepare(
+        my $sth = $dbh->prepare(
             "UPDATE `$sql_table` SET date_last_seen = ?, real_name = ?, servers = ? WHERE unique_id = ?"
         );
         foreach my $nname ($serv->nicks()) {
@@ -443,10 +453,6 @@ sub namechan {
             if (!grep(/$unick;$ident;$host/, @list)) {
                 Irssi::active_server->send_raw("WHOIS " . $unick);
                 $count++;
-
-                # TODO: Maybe sleep? This can really lock the client up
-                #		as well as probably make some sysops mad
-                #		fuck it, #getrekt
             } else {
                 if (settings_get_bool('track_sql_enable')) {
                     $sth->execute(get_sql_time(), $real_name, $servers,
@@ -527,32 +533,32 @@ sub importAKA {
 sub sql_init {
     my $create_database   = "CREATE DATABASE IF NOT EXISTS `$sql_db`;";
     my $create_main_table = "CREATE TABLE IF NOT EXISTS `$sql_table` (
-	`id` int(9) NOT NULL AUTO_INCREMENT,
-	`nickname` varchar(255) CHARACTER SET utf8 NOT NULL,
-	`ident` varchar(255) CHARACTER SET utf8 NOT NULL,
-	`hostname` varchar(255) CHARACTER SET utf8 NOT NULL,
-	`real_name` varchar(255) CHARACTER SET utf8 DEFAULT NULL,
-	`registered` tinyint(1) DEFAULT 0,
-	`bot` tinyint(9) DEFAULT 0,
-	`date_first_seen` datetime DEFAULT NULL,
-	`date_last_seen` datetime DEFAULT NULL,
-	`date_registered` datetime DEFAULT NULL,
-	`date_modified` timestamp NULL DEFAULT NULL ON UPDATE current_timestamp(),
-	`unique_id` varchar(255) CHARACTER SET utf8 NOT NULL,
-	PRIMARY KEY (`id`),
-	UNIQUE KEY `UNIQUE` (`unique_id`)
-	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `id` int(9) NOT NULL AUTO_INCREMENT,
+    `nickname` varchar(255) CHARACTER SET utf8 NOT NULL,
+    `ident` varchar(255) CHARACTER SET utf8 NOT NULL,
+    `hostname` varchar(255) CHARACTER SET utf8 NOT NULL,
+    `real_name` varchar(255) CHARACTER SET utf8 DEFAULT NULL,
+    `registered` tinyint(1) DEFAULT 0,
+    `bot` tinyint(9) DEFAULT 0,
+    `date_first_seen` datetime DEFAULT NULL,
+    `date_last_seen` datetime DEFAULT NULL,
+    `date_registered` datetime DEFAULT NULL,
+    `date_modified` timestamp NULL DEFAULT NULL ON UPDATE current_timestamp(),
+    `unique_id` varchar(255) CHARACTER SET utf8 NOT NULL,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `UNIQUE` (`unique_id`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-	CREATE TABLE IF NOT EXISTS`track_data` (
-	`id` int(10) unsigned NOT NULL AUTO_INCREMENT,
-	`server` varchar(100) NOT NULL,
-	`channel` varchar(100) NOT NULL,
-	`date_added` timestamp NULL DEFAULT NULL ON UPDATE current_timestamp(),
-	`unique_id` varchar(255) NOT NULL COMMENT 'users unique id',
-	`unique_data_id` varchar(255) NOT NULL COMMENT 'users unique id with chan/serv',
-	PRIMARY KEY (`id`),
-	UNIQUE KEY `UNIQUE` (`unique_data_id`)
-	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
+    CREATE TABLE IF NOT EXISTS`track_data` (
+    `id` int(10) unsigned NOT NULL AUTO_INCREMENT,
+    `server` varchar(100) NOT NULL,
+    `channel` varchar(100) NOT NULL,
+    `date_added` timestamp NULL DEFAULT NULL ON UPDATE current_timestamp(),
+    `unique_id` varchar(255) NOT NULL COMMENT 'users unique id',
+    `unique_data_id` varchar(255) NOT NULL COMMENT 'users unique id with chan/serv',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `UNIQUE` (`unique_data_id`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
 
     chomp(my $t_out =
           `mysql -e 'SELECT * FROM mysql.user' -u $sql_user -p'$sql_pass' 2>&1`
@@ -577,9 +583,9 @@ sub sql_init {
 
         chomp(
             $t_out = `mysql -e 'use "$sql_db";
-			GRANT ALL PRIVILEGES ON $sql_table.* TO "$sql_user"@"$sql_host" IDENTIFIED BY "$sql_pass";
-			GRANT ALL PRIVILEGES ON track_data.* TO "$sql_user"@"$sql_host" IDENTIFIED BY "$sql_pass";
-			FLUSH PRIVILEGES;' 2>&1`
+            GRANT ALL PRIVILEGES ON $sql_table.* TO "$sql_user"@"$sql_host" IDENTIFIED BY "$sql_pass";
+            GRANT ALL PRIVILEGES ON track_data.* TO "$sql_user"@"$sql_host" IDENTIFIED BY "$sql_pass";
+            FLUSH PRIVILEGES;' 2>&1`
         );
         $t_out = "%GGood%N" if length $t_out < 3;
         Irssi::print("%YPrivilege creation result: $t_out");
@@ -693,33 +699,33 @@ sub raw_to_sql {
 }
 
 sub process_chans {
-	my ($server, $chans, $server_real_address) = @_;
+    my ($server, $chans, $server_real_address) = @_;
 
-	if ($chans =~ /.*? .*? :#/) {
-		my @spl = split(/:/, $chans);
-		my $chanlist = $spl[1];
-		my @chansplit = split(" ", $chanlist);
-		
-		foreach my $channel (@chansplit) {
-			my $temp = decode_base64($active_uid);
-			my ($unick, $ident, $host);
-			if ($temp =~ /(.*?):(.*?):(.*)/) {
-				$unick = $1;
-				$ident = $2;
-				$host  = $3;
-			}
-			my $unique_data_id = get_unique_id($unick, $ident, $host, $channel);
-			my $sth = $dbh->prepare("SELECT `unique_id`,`unique_data_id` FROM track_data WHERE unique_data_id = ?")
-				or die("Unable to prepare statement: " . $dbh->errstr);
-			$sth->execute($unique_data_id);
+    if ($chans =~ /.*? .*? :#/) {
+        my @spl = split(/:/, $chans);
+        my $chanlist = $spl[1];
+        my @chansplit = split(" ", $chanlist);
 
-			my @result = $sth->fetchrow_array();
-			if (!$result[0]) {
-			    $sth = $dbh->prepare("INSERT INTO track_data (server, channel, unique_id, unique_data_id) VALUES (?, ?, ?, ?)");
-				$sth->execute($server_real_address, $channel, $active_uid, $unique_data_id);
-			}
-		}
-	}
+        foreach my $channel (@chansplit) {
+            my $temp = decode_base64($active_uid);
+            my ($unick, $ident, $host);
+            if ($temp =~ /(.*?):(.*?):(.*)/) {
+                $unick = $1;
+                $ident = $2;
+                $host  = $3;
+            }
+            my $unique_data_id = get_unique_id($unick, $ident, $host, $channel);
+            my $sth = $dbh->prepare("SELECT `unique_id`,`unique_data_id` FROM track_data WHERE unique_data_id = ?")
+                or die("Unable to prepare statement: " . $dbh->errstr);
+            $sth->execute($unique_data_id);
+
+            my @result = $sth->fetchrow_array();
+            if (!$result[0]) {
+                $sth = $dbh->prepare("INSERT INTO track_data (server, channel, unique_id, unique_data_id) VALUES (?, ?, ?, ?)");
+                $sth->execute($server_real_address, $channel, $active_uid, $unique_data_id);
+            }
+        }
+    }
 }
 
 sub notice {
