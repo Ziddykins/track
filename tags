@@ -1,0 +1,26 @@
+!_TAG_FILE_FORMAT	2	/extended format; --format=1 will not append ;" to lines/
+!_TAG_FILE_SORTED	1	/0=unsorted, 1=sorted, 2=foldcase/
+!_TAG_PROGRAM_AUTHOR	Darren Hiebert	/dhiebert@users.sourceforge.net/
+!_TAG_PROGRAM_NAME	Exuberant Ctags	//
+!_TAG_PROGRAM_URL	http://ctags.sourceforge.net	/official site/
+!_TAG_PROGRAM_VERSION	5.9~svn20110310	//
+check_sql_info	track.pl	/^sub check_sql_info {$/;"	s
+conv	track.pl	/^sub conv {$/;"	s
+do_conv	track.pl	/^sub do_conv {$/;"	s
+get_sql_time	track.pl	/^sub get_sql_time {$/;"	s
+get_unique_id	track.pl	/^sub get_unique_id {$/;"	s
+importAKA	track.pl	/^sub importAKA {$/;"	s
+init	track.pl	/^sub init {$/;"	s
+joining	track.pl	/^sub joining {$/;"	s
+namechan	track.pl	/^sub namechan {$/;"	s
+nchange	track.pl	/^sub nchange {$/;"	s
+notice	track.pl	/^sub notice {$/;"	s
+process_chans	track.pl	/^sub process_chans {$/;"	s
+process_info	track.pl	/^sub process_info {$/;"	s
+raw_to_sql	track.pl	/^sub raw_to_sql {$/;"	s
+sql_init	track.pl	/^sub sql_init {$/;"	s
+track	track.pl	/^sub track {$/;"	s
+track_options	track.pl	/^sub track_options {$/;"	s
+unconv	track.pl	/^sub unconv {$/;"	s
+uniq	track.pl	/^sub uniq {$/;"	s
+whois_signal	track.pl	/^sub whois_signal {$/;"	s
