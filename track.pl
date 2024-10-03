@@ -6,24 +6,29 @@ use diagnostics;
 
 use feature q/state/;
 
-use Irssi qw(servers
-  settings_get_str  settings_add_str
-  settings_get_bool settings_add_bool
-  settings_set_str settings_set_bool);
-
+use Irssi;
 use MIME::Base64 qw(encode_base64 decode_base64);
+use English '-no_match_vars';
 use Data::Dumper;
 use ReadonlyX;
 use DateTime;
 use DBI;
 
-our $VERSION = '3.0';
+Readonly::Scalar my $SCRIPT_NAME     => 'track';
+Readonly::Scalar my $NAME_BUFFER_MAX => 25;
+Readonly::Scalar my $EMPTY_STRING    => qw{};
+Readonly::Scalar my $ZERO            => 0;
+Readonly::Scalar my $SUCCESS         => 1;
+Readonly::Scalar my $FAILURE         => 0;
+Readonly::Scalar my %DB              => {};
+
+our $VERSION = '2.4';
 use vars qw($VERSION %IRSSI);
 
 %IRSSI = (
     authors     => 'Ziddy',
     contact     => 'DALnet',
-    name        => 'track',
+    name        => $SCRIPT_NAME,
     description => 'Keeps track of users by building a database'
       . 'of online, joining and nickchanges. Regex-cabable'
       . 'for the most part, AKA import available. Search by'
@@ -32,171 +37,152 @@ use vars qw($VERSION %IRSSI);
     url     => 'none',
 );
 
-my $quiet_mode        = 0;
-my $name_buffer_count = 0;
-my $sql               = 0;
-my $pulling_whois     = 0;
-my $track_file;
-my $track_fh;
+Readonly::Hash my %SCRIPT_OPTS => (
+    track_file       => { name => 'track_file',       value => Irssi::get_irssi_dir() . '/track.lst' },
+    track_quiet      => { name => 'track_quiet',      value => $ZERO },
+    track_sql_enable => { name => 'track_sql_enable', value => $ZERO },
+    track_raw_enable => { name => 'track_raw_enable', value => $ZERO },
+    track_sql_host   => { name => 'track_sql_host',   value => $EMPTY_STRING },
+    track_sql_port   => { name => 'track_sql_port',   value => $EMPTY_STRING },
+    track_sql_user   => { name => 'track_sql_user',   value => $EMPTY_STRING },
+    track_sql_pass   => { name => 'track_sql_pass',   value => $EMPTY_STRING },
+    track_sql_db     => { name => 'track_sql_db',     value => $EMPTY_STRING },
+    track_sql_table  => { name => 'track_sql_table',  value => $EMPTY_STRING },
+);
+
+my $quiet_mode        = $ZERO;
+my $name_buffer_count = $ZERO;
+my $sql               = $ZERO;
+my $pulling_whois     = $ZERO;
+
 my $active_server;
 my $active_nick;
 my $active_uid;
+
 my ($sql_host, $sql_pass, $sql_user, $sql_table, $sql_port, $sql_db);
 my $dbh;
 
+track_banner();
+
+Irssi::command_bind($SCRIPT_NAME => \&track);
+
+Irssi::signal_add('message join',       'joining');
+Irssi::signal_add('message nick',       'nchange');
+Irssi::signal_add('message irc notice', 'notice');
+
+Irssi::signal_add_first('event 311', 'whois_signal');
+Irssi::signal_add_last('event 319', 'process_chans');
+Irssi::signal_add_last('setup changed', 'init');
+init();
+
 sub init {
     my $connect_msg;
-    my $db_count = 0;
+    my $track_file;
 
-    settings_add_bool('track', 'track_quiet',      0);
-    settings_add_bool('track', 'track_sql_enable', 0);
-    settings_add_bool('track', 'track_raw_enable', 0);
-    settings_add_str('track', 'track_sql_host',  q{});
-    settings_add_str('track', 'track_sql_user',  q{});
-    settings_add_str('track', 'track_sql_pass',  q{});
-    settings_add_str('track', 'track_sql_port',  q{});
-    settings_add_str('track', 'track_sql_table', q{});
-    settings_add_str('track', 'track_sql_db',    q{});
-    settings_add_str('track', 'track_file', Irssi::get_irssi_dir() . '/track.lst');
+    $DB{limits}{name_buffer} = $NAME_BUFFER_MAX;
+    $DB{count}{raw}{name_buffer} = $ZERO;
+    $DB{count}{sql}{name_buffer} = $ZERO;
+    $DB{count}{raw} = $ZERO;
+    $DB{count}{sql} = $ZERO;
 
-    $track_file = settings_get_str('track_file');
+    Irssi::settings_add_bool($SCRIPT_NAME,      $SCRIPT_OPTS{track_quiet}{name},      $SCRIPT_OPTS{track_quiet}{value});
+    Irssi::settings_add_bool($SCRIPT_NAME, $SCRIPT_OPTS{track_sql_enable}{name}, $SCRIPT_OPTS{track_sql_enable}{value});
+    Irssi::settings_add_bool($SCRIPT_NAME, $SCRIPT_OPTS{track_raw_enable}{name}, $SCRIPT_OPTS{track_raw_enable}{value});
+    Irssi::settings_add_str($SCRIPT_NAME,        $SCRIPT_OPTS{track_file}{name},       $SCRIPT_OPTS{track_file}{value});
+    Irssi::settings_add_str($SCRIPT_NAME,    $SCRIPT_OPTS{track_sql_host}{name},   $SCRIPT_OPTS{track_sql_host}{value});
+    Irssi::settings_add_str($SCRIPT_NAME,    $SCRIPT_OPTS{track_sql_user}{name},   $SCRIPT_OPTS{track_sql_user}{value});
+    Irssi::settings_add_str($SCRIPT_NAME,    $SCRIPT_OPTS{track_sql_pass}{name},   $SCRIPT_OPTS{track_sql_pass}{value});
+    Irssi::settings_add_str($SCRIPT_NAME,    $SCRIPT_OPTS{track_sql_port}{name},   $SCRIPT_OPTS{track_sql_port}{value});
+    Irssi::settings_add_str($SCRIPT_NAME,   $SCRIPT_OPTS{track_sql_table}{name},  $SCRIPT_OPTS{track_sql_table}{value});
+    Irssi::settings_add_str($SCRIPT_NAME,      $SCRIPT_OPTS{track_sql_db}{name},     $SCRIPT_OPTS{track_sql_db}{value});
+
+    $track_file = Irssi::settings_get_str($SCRIPT_OPTS{track_file}{name});
 
     if ($track_file && -e $track_file) {
-        Readonly my $FILE_SIZE => 7;
-        Readonly my $ONE_OH_TWO_FOUR => 1024;
+        Readonly my $FILE_SIZE       => 7;
+        Readonly my $KILOBYTE => 1024;
 
-        my $db_size = sprintf '%.02f KB', (stat $track_file)[$FILE_SIZE] / $ONE_OH_TWO_FOUR;
+        my $db_size  = sprintf '%.02f KB', (stat $track_file)[$FILE_SIZE] / $KILOBYTE;
         $connect_msg = "%NLoaded track database: '%G$track_file%N' (Size: %C$db_size%N)";
-    } else {
-        $track_file = Irssi::get_irssi_dir() . '/track.lst';
-        Irssi::print('Initializing track database (raw) using default');
-        Irssi::print('location: ' . $track_file);
     }
 
-    $quiet_mode = settings_get_bool('track_quiet');
+    $quiet_mode = Irssi::settings_get_bool($SCRIPT_OPTS{track_quiet}{name});
 
     $connect_msg = $quiet_mode ? '(Quiet: %ROFF%N)' : '(Quiet: %GON%N)';
 
-    $sql_host  = settings_get_str('track_sql_host');
-    $sql_user  = settings_get_str('track_sql_user');
-    $sql_pass  = settings_get_str('track_sql_pass');
-    $sql_port  = settings_get_str('track_sql_port');
-    $sql_table = settings_get_str('track_sql_table');
-    $sql_db    = settings_get_str('track_sql_db');
+    $sql_host  = Irssi::settings_get_str($SCRIPT_OPTS{track_sql_host}{name});
+    $sql_user  = Irssi::settings_get_str($SCRIPT_OPTS{track_sql_user}{name});
+    $sql_pass  = Irssi::settings_get_str($SCRIPT_OPTS{track_sql_pass}{name});
+    $sql_port  = Irssi::settings_get_str($SCRIPT_OPTS{track_sql_port}{name});
+    $sql_table = Irssi::settings_get_str($SCRIPT_OPTS{track_sql_table}{name});
+    $sql_db    = Irssi::settings_get_str($SCRIPT_OPTS{track_sql_db}{name});
 
-    if (settings_get_str('track_sql_enable')) {
+    if (Irssi::settings_get_str($SCRIPT_OPTS{track_sql_enable}{name})) {
         if (check_sql_info()) {
             sql_init();
             my $sth = $dbh->prepare("SELECT COUNT(*) FROM $sql_table;");
             $sth->execute;
-            $db_count = $sth->fetchrow();
+            $DB{count}{sql} = $sth->fetchrow();
         }
     } else {
-        Irssi::print('%RSQL mode not active');
+        Irssi::print('%RSQL mode not active%N');
     }
 
-    open $track_fh, '+<', $track_file
-        or die "Could not open '$track_file' for read-write operations: " . $! . "\n";
+    init_db();
 
-    my @t  = <$track_fh>;
-    my $lc = scalar @t;
+    Irssi::print("$connect_msg\n");
+    Irssi::print(' Raw DB: %G' . $DB{count}{raw} . '%N');
+    Irssi::print(' SQL DB: %G' . $DB{count}{sql} . '%N ');
+    Irssi::print('NBuffer: %G' . $DB{limits}{name_buffer} . '%N  ');
 
-    close $track_fh
-        or die "Couldn't close $track_file: $!\n";
-
-    Irssi::print($connect_msg . "\n");
-    Irssi::print("Raw DB: %G$lc");
-    Irssi::print("SQL DB: %G$db_count");
-    return 0;
+    return $SUCCESS;
 }
-
-my $help =
-    "\n%_%C%UHelp%N\n\n"
-  . "%U/track gather%U\n"
-  . "     Join your channels then run this\n"
-  . "     to gather nicks already online\n"
-  . "     This may take a while on first run\n\n"
-  .
-
-  "%U/track quiet%U\n"
-  . "     Toggle quiet. If this is on, it wont\n"
-  . "     show when a person is added or already\n"
-  . "     existing in the database\n\n"
-  .
-
-  "%U/track count%U\n" . "     Print amount of database entries\n\n" .
-
-  "%U/track import <file>%U\n"
-  . "     This allows you to import AKA data-\n"
-  . "     bases. AKA is a popular mIRC script\n"
-  . "     which allows you to keep track of people\n"
-  . "     by nickname and hostmask. This imports\n"
-  . "     all of the nicknames and hosts and fills\n"
-  . "     in the ident with AKAImport, since AKA does\n"
-  . "     not keep track of idents\n\n"
-  .
-
-  "%U/track search <sql|raw> <%_ident%_|%_nick%_|%_host%_|%_all%_> %I(literal/regex)%I <input>%U\n"
-  . "     The first parameter specifies whether or not you want to search\n"
-  . "     the raw database, or the SQL database. You then choose which attribute\n"
-  . "     to parse; alternatively you can search all of them (slow, depending on db size)\n"
-  . "     For your input parameter, string literals or regular expressions\n"
-  . "     can be unused.\n"
-  . "     See below for a better idea at how these work.\n\n"
-  .
-
-  "%U%_%CExamples%N\n"
-  . "     /track search raw host .*(or|pa|tx|fl)..*comcast.*\n"
-  . "     /track search raw host (24|195)[.-](226|185)[-.][0-9]{1,3}[-.][0-9]{1,3}\n"
-  . "         Matches: 195.185.x.x\n"
-  . "         Matches: CPE-x24-185-xxx-xx.y.y.y.net.au\n"
-  . "     /track search raw nick Zi[dptb]+y\n"
-  . "         Matches: Ziddy, Zippy, Zidy, Zitty, Zipty, etc.\n"
-  . "TODO: XXX: FIXME:  XXXXXXXXXXXXXXXXX ADD SQL EXAMPLES ONCE IMPLEMENTED XXXXXXXXXXXXXXXXXXXXXXX\n\n";
 
 sub whois_signal {
     my ($server, $data, $txtserver) = @_;
     my ($me, $nick, $ident, $host, $unused, $real_name) = split q{ }, $data;
-    my @list       = <$track_fh>;
-    my $registered = 0;
-    my $unique_id  = get_unique_id($nick, $ident, $host);
+    my $registered = $ZERO;
+    my $unique_id = get_unique_id($nick, $ident, $host);
     my $chans;
+
+    Irssi::print('%RDEBUG');
+    print Dumper(Irssi::active_server->nicks_get_same($nick));
+    Irssi::print('=======%N');
     $active_server = $server;
     $active_uid    = $unique_id;
-    $nick          = conv($nick);
+
+    $nick = conv($nick);
     $ident =~ s/^~//xms;
     $ident = conv($ident);
 
     $real_name =~ s/^://xms;
-    $real_name =~ s/[^ -~]//xms;
+    $real_name =~ s/[^ -~]//gxms;
 
     Irssi::print("derder: $data");
 
-    # 307 - identified for nick
-    # 319 - channels list
-
-    # 2 noisy fr
-    # Irssi::active_server->send_raw("PRIVMSG $nick :\001VERSION\001");
     if ($data =~ /has identified for this nick/xms) {
         $registered = 1;
     }
 
     if ($data =~ /channels/xms) {
-        my ($unused, $channels) = split($data, ':');
+        ($unused, my $channels) = split /$data/xms, qw{:};
         my $sth = $dbh->prepare("SELECT `channels` FROM $sql_table WHERE unique_id = ?")
-            or die 'Unable to prepare statement: ' . $dbh->errstr;
+                    or carp("Unable to prepare statement: ${dbh->errstr}");
+
         $sth->execute($unique_id);
 
         my @result = $sth->fetchrow_array();
-        if (!$result[0] or $result[0] =~ /None/xms) {
+
+        if (!$result[0] || $result[0] =~ /None/xms) {
             $sth = $dbh->prepare("UPDATE $sql_table SET channels = ? WHERE unique_id = ?");
             $sth->execute($channels, $unique_id);
         }
     }
-    
-    my @gayload = ($server, $nick, $ident, $host, $real_name, $chans, $registered);
-    process_info(\@gayload);
-    return 0;
+
+    process_info($server, $nick, $ident, $host, $real_name, $chans,
+        $registered);
+
+    return $SUCCESS;
 }
 
 sub joining {
@@ -205,8 +191,10 @@ sub joining {
     my @spl   = split /@/xms, $host;
     my $ident = $spl[0];
     my $mask  = $spl[1];
-    ($ident = $ident) =~ s/^~//xms;
-    $ident         = conv($ident);
+
+    $ident =~ s/^~//xms;
+    $ident = conv($ident);
+
     $active_server = $server;
     $active_nick   = $unick;
 
@@ -216,12 +204,14 @@ sub joining {
 
     Irssi::active_server->send_raw("WHOIS $unick");
     Irssi::active_server->send_raw("nickserv info $unick");
+
+    return $SUCCESS;
 }
 
 sub nchange {
     my ($server, $newnick, $oldnick, $host) = @_;
     $newnick = conv($newnick);
-    my @spl   = split (/@/xms, $host);
+    my @spl   = split /@/xms, $host;
     my $ident = $spl[0];
     my $mask  = $spl[1];
     ($ident = $ident) =~ s/^~//xms;
@@ -231,86 +221,52 @@ sub nchange {
 
     Irssi::active_server->send_raw("WHOIS $newnick");
     Irssi::active_server->send_raw("nickserv info $newnick");
+
+    return $SUCCESS;
 }
 
 sub process_info {
     my ($server, $nick, $ident, $mask, $real_name, $channels, $registered) = @_;
-    my $name_buffer_max = 25;
     $channels   //= 'None';
-    $registered //= 0;
+    $registered //= $ZERO;
 
-    if (settings_get_str('track_raw_enable')) {
-        open my $fh2, '<', $track_file
-            or die "Couldn't open $track_file for read: $!\n";
-
-        my @list = <$fh2>;
-
-        close $fh2
-            or die "Couldn't close $track_file: $!\n";
-
-        open my $fh, '>>', $track_file
-            or die "Couldn't open $track_file for write: $!\n";
-
+    if (Irssi::settings_get_str($SCRIPT_OPTS{track_raw_enable}{name})) {
         $name_buffer_count++;
 
-        if (!grep (/$nick;$ident;$mask/xms, @list)) {
-            print $fh "$nick;$ident;$mask\n";
-            Irssi::print("%GADDED $nick;$ident;$mask") if !$quiet_mode;
+        if (!exists $DB{$nick}) {
+            $DB{$nick}{ident} = $ident;
+            $DB{$nick}{mask}  = $mask;
+
+            if (!$quiet_mode) {
+                Irssi::print("%GADDED $nick;$ident;$mask");
+            }
         } else {
-            Irssi::print("%REXIST $nick;$ident;$mask") if !$quiet_mode;
+            if (!$quiet_mode) {
+                Irssi::print("%REXIST $nick;$ident;$mask");
+            }
         }
 
-        close $fh
-            or die "Couldn't close $track_file: $!\n";
-
-        if ($name_buffer_count >= $name_buffer_max) {
-            open (my $fhr, '<', $track_file) or die "Couldn't open $track_file for read: $!\n";
-            my @listt = <$fhr>;
-            close $fhr or die "Couldn't close $track_file: $!\n";
-            my @name_buffer = uniq(@list);
-
-            open (my $fhw, '>', $track_file) or die "Couldn't open $track_file for overwrite: $!\n";;
-            print $fhw @name_buffer;
-            close $fhw or die "Couldn't close $track_file: $!\n";
-
-            $name_buffer_count = 0;
-        }
+        do_buffer_checks();
     }
 
-    if (settings_get_bool('track_sql_enable')) {
+    if (Irssi::settings_get_bool($SCRIPT_OPTS{track_sql_enable}{name})) {
         my $unique_id = get_unique_id($nick, $ident, $mask);
-        my $sth       = $dbh->prepare(
-            "SELECT `unique_id` FROM $sql_table WHERE unique_id = ?")
-          or die ('Unable to prepare statement: ' . $dbh->errstr);
-        $sth->execute($unique_id);
+        my $sql_query = <<'SQL';
+            INSERT IGNORE INTO $sql_table
+                (`nickname`, `ident`, `hostname`, `date_first_seen`, `date_last_seen`, `real_name`, `registered`, `bot`, `unique_id`)
+            VALUES (?,?,?,?,?,?,?,?,?) 
+                ON DUPLICATE KEY UPDATE `date_last_seen` = ?, `real_name` = ?, `registered` = ?;
+SQL
 
-        my @result = $sth->fetchrow_array();
-        if (!$result[0]) {
-            $sth = $dbh->prepare(
-                qq/
-                INSERT INTO `$sql_table` (
-                nickname,           ident,  hostname,
-                date_first_seen,  date_last_seen, real_name,
-                registered,             bot, unique_id
-                ) VALUES (?,?,?,?,?,?,?,?,?)/
-            ) or warn "Can't prepare statement: $! ($@) $dbh->errstr;";
+        my $sth = $dbh->prepare($sql_query) 
+            or carp('Can\'t prepare statement: ' . $dbh->errstr);
 
-            $sth->execute(
-                $nick,          $ident,
-                $mask,          get_sql_time(),
-                get_sql_time(), $real_name,
-                $registered,    0,
-                $unique_id
-            ) or warn "Sry m8 no go: $! ($@) $dbh->errstr";
-        } else {
-            $sth = $dbh->prepare(
-                "UPDATE `$sql_table` SET date_last_seen = ?, real_name = ?  WHERE unique_id = ?"
-            );
-            $sth->execute(get_sql_time(), $real_name, $unique_id);
-
-            #TODO: Quieter way to collect channels
-        }
+        $sth->execute(
+            $nick, $ident, $mask, get_sql_time(), get_sql_time(), $real_name, $registered, $ZERO, $unique_id, get_sql_time(), $real_name, $registered
+        ) or carp("Can't insert entry: " . $dbh->errstr);
     }
+
+    return $SUCCESS;
 }
 
 sub get_unique_id {
@@ -319,20 +275,24 @@ sub get_unique_id {
     if ($channel) {
         return encode_base64("$unick:$ident:$host:$channel");
     }
+
     return encode_base64("$unick:$ident:$host");
 }
 
 sub track {
     my $match;
     my $input = $_[0];
+
     chomp ($input);
-    my @spl = split (/\s/xms, $input);
+    print "INPUT: $input\n";
+
+    my @spl = split (/\s/, $input);
     my $type;
 
-    if (defined $spl[0]) {
+    if ($spl[0]) {
         $type = $spl[0];
     } else {
-        Irssi::print($help);
+        help();
         return;
     }
 
@@ -352,8 +312,11 @@ sub track {
     }
 
     if ($type eq 'debug') {
-        my @tests = ('"^^DumbNick^^', '[[^^bitchtits^^]]', '[][][]',
-                     '\fugmuffin\\', 'okthatsgood', '@@[[lol]]##');
+        my @tests = (
+            '"^^DumbNick^^', '[[^^bitchtits^^]]',
+            '[][][]',        '\fugmuffin\\',
+            'okthatsgood',   '@@[[lol]]##'
+        );
         foreach my $test (@tests) {
             my $result = do_conv($test);
             Irssi::print("%GTesting : %N$test%N");
@@ -365,11 +328,7 @@ sub track {
         my $which = $spl[1];
         $which //= 'raw';
         if ($which eq 'raw') {
-            open my $fh, '<', settings_get_str('track_file');
-            my @tmp = <$fh>;
-            close $fh;
-            Irssi::print(
-                '%GRaw Database Entries%N: ' . scalar (@tmp) . ' users');
+            Irssi::print("%RRAW%N Database Entries%N: " . $DB{count}{raw} . " users");
         } elsif ($which eq 'sql') {
             my $sth = $dbh->prepare("SELECT COUNT(*) FROM $sql_table");
             $sth->execute();
@@ -385,10 +344,10 @@ sub track {
     } elsif ($type eq 'quiet') {
         $quiet_mode = $quiet_mode ? 0 : 1;
         Irssi::print("%GQuiet mode set to $quiet_mode");
-        settings_set_bool('track_quiet', $quiet_mode);
+        Irssi::settings_set_bool('track_quiet', $quiet_mode);
         return;
     } elsif ($type eq 'help') {
-        Irssi::print($help);
+        help();
         return;
     } elsif ($type eq 'search') {
         my ($unused, $which, $field, $term) = split / /xms, $input;
@@ -405,30 +364,22 @@ sub track {
 
                 if ($field eq 'host') {
                     if ($line_host =~ /$pcr/) {
-                        Irssi::print(
-                            "%GHost[%n$term%G]%n: $line_nick used $line_ident on -> %_$line_host%_ <-"
-                        );
+                        Irssi::print("%GHost[%n$term%G]%n: $line_nick used $line_ident on -> %_$line_host%_ <-");
                         $match = 1;
                     }
                 } elsif ($field eq 'nick') {
                     if ($line_nick =~ /$pcr/) {
-                        Irssi::print(
-                            "%GNick[%n$term%G]%n: -> %_$line_nick%_ <- used $line_ident on $line_host"
-                        );
+                        Irssi::print("%GNick[%n$term%G]%n: -> %_$line_nick%_ <- used $line_ident on $line_host");
                         $match = 1;
                     }
                 } elsif ($field eq 'ident') {
                     if ($line_ident =~ /$pcr/) {
-                        Irssi::print(
-                            "%GIdent[%n$term%G]%n: $line_nick used -> %_$line_ident%_ <- on $line_host"
-                        );
+                        Irssi::print("%GIdent[%n$term%G]%n: $line_nick used -> %_$line_ident%_ <- on $line_host");
                         $match = 1;
                     }
                 } elsif ($field eq 'all') {
                     if ($line =~ /$pcr/) {
-                        Irssi::print(
-                            "%GALL[%n$term%G]%N: -> $line_nick used $line_ident on $line_host <-"
-                        );
+                        Irssi::print("%GALL[%n$term%G]%N: -> $line_nick used $line_ident on $line_host <-");
                         $match = 1;
                     }
                 } else {
@@ -455,17 +406,17 @@ sub track {
         Irssi::print('%RNo data to return');
     }
 
-    return 0;
+    return $SUCCESS;
 }
 
 sub uniq {
     my %seen;
     grep !$seen{$_}++, @_;
-    return 0;
+    return $SUCCESS;
 }
 
 sub namechan {
-    my $count = 0;
+    my $count = $ZERO;
 
     foreach my $serv (Irssi::channels()) {
         my $curserv = $serv->{server}->{tag};
@@ -474,32 +425,32 @@ sub namechan {
         );
         foreach my $nname ($serv->nicks()) {
             my $unick = conv($nname->{nick});
-            open (my $fh, '<', $track_file);
+            open my $fh, '<', $track_file;
             my @list = <$fh>;
-            close ($fh);
+            close $fh;
             my $real_name = $nname->{realname};
-            my @temp      = split ("@", $nname->{host});
+            my @temp      = split /@/, $nname->{host};
             my $ident     = $temp[0];
             my $host      = $temp[1];
             my $unique_id = get_unique_id($unick, $ident, $host);
             my $servers   = Irssi::active_server->{real_address};
-            $ident     =~ s/^~//;
-            $real_name =~ s/[^ -~]//g;    # clear all non-printable characters
+            $ident     =~ s/^~//xms;
+            $real_name =~ s/[^ -~]//xmsg;    # clear all non-printable characters
 
-            if (!grep (/$unick;$ident;$host/xms, @list)) {
+            if (!grep /$unick;$ident;$host/xms, @list) {
                 Irssi::active_server->send_raw('WHOIS ' . $unick);
                 $count++;
             } else {
-                if (settings_get_bool('track_sql_enable')) {
-                    $sth->execute(get_sql_time(), $real_name, $servers,
-                        $unique_id);
+                if (Irssi::settings_get_bool('track_sql_enable')) {
+                    $sth->execute(get_sql_time(), $real_name, $servers, $unique_id);
                 }
                 Irssi::print("%RAlready gathered $unick") if !$quiet_mode;
             }
         }
     }
     Irssi::print("%GGathering complete - Added $count new entries");
-    return 0;
+
+    return $SUCCESS;
 }
 
 sub conv {
@@ -510,6 +461,7 @@ sub conv {
     ($data = $data) =~ s/\[/@@/g;
     ($data = $data) =~ s/\^/##/g;
     ($data = $data) =~ s/\\/&&/g;
+
     return $data;
 }
 
@@ -521,11 +473,13 @@ sub unconv {
     ($data = $data) =~ s/@@/\[/g;
     ($data = $data) =~ s/##/\^/g;
     ($data = $data) =~ s/%%/\\/g;
+
     return $data;
 }
 
 sub do_conv {
     my @data = split //xms, $_[0];
+
     return if scalar @data < 1;
 
     my %conversions = (
@@ -538,15 +492,15 @@ sub do_conv {
         '^'  => '##',
         '\\' => '%%',
     );
-   
-    for (my $i=0; $i<scalar @data - 1; $i++) {
+
+    for (my $i = 0; $i < scalar @data - 1; $i++) {
         foreach my $key (keys %conversions) {
             my $value = $conversions{$key};
             $data[$i] =~ s/\Q$key\E/\Q$value\E/gxms;
         }
     }
-    
-    return join('', @data);
+
+    return join ('', @data);
 }
 
 #Messy for now
@@ -556,7 +510,7 @@ sub importAKA {
         open (my $fh, '<', $input);
         my @list = <$fh>;
         close ($fh);
-        my $ip = 0;
+        my $ip = $ZERO;
         my ($string, $import);
         foreach my $line (@list) {
             chomp ($line);
@@ -654,19 +608,21 @@ sub sql_init {
     }
 
     $dbh = DBI->connect("DBI:MariaDB:$sql_db", $sql_user, $sql_pass)
-      or die "Unable to connect to SQL database: $!\n";
+      or die "Unable to connect to SQL database: $CHILD_ERROR\n";
     Irssi::print("%GSuccessfully connected to database %C$sql_db%N");
     Irssi::print('%G*%R*%Y*%B*%N SQL Mode fully activated!!! %B*%Y*%R*%G*%N');
-    settings_set_bool('track_sql_enable', 1);
+    Irssi::settings_set_bool('track_sql_enable', 1);
+
+    return $SUCCESS;
 }
 
 sub track_options {
     my $input = $_[0];
     $input =~ s/set //;
 
-    my ($command, $argument, $value) = split / /xms, $input;
+    my ($command, $argument, $value) = split / /, $input;
 
-    if ($command eq 'sql' && !date_first_seened($argument)) {
+    if ($command eq 'sql' && !$argument) {
         if (check_sql_info()) {
             $sql = 1;
             Irssi::print('%GSQL mode successfully activated');
@@ -674,50 +630,50 @@ sub track_options {
         } else {
             my @missing;
             foreach my $opt ('host', 'db', 'table', 'user', 'pass', 'port') {
-                if (!settings_get_str("track_sql_$opt")) {
+                if (!Irssi::settings_get_str("track_sql_$opt")) {
                     push (@missing, $opt);
                 }
             }
             Irssi::print(
-                '%RSQL mode cannot be enabled until required information has been supplied via \'set sql\''
+                '%RSQL mode cannot be enabled until required information has been supplied via \'/track set sql <arg> <val>\''
             );
             Irssi::print('%RMissing SQL information: ' . join ', ', @missing);
         }
-    } elsif ($command eq 'sql' && $argument =~ /(host|db|user|pass|port|table)/)
-    {
+    } elsif ($command eq 'sql' && $argument =~ /(host|db|user|pass|port|table)/) {
         my $setting = $1;
         if (!$value) {
             Irssi::print("You must supply a value to set option '$argument'");
         }
-        if (settings_get_str("track_sql_$setting")) {
-            settings_set_str("track_sql_$setting", $value);
+        if (Irssi::settings_get_str("track_sql_$setting")) {
+            Irssi::settings_set_str("track_sql_$setting", $value);
             Irssi::print("Overwrote current $setting value");
         } else {
-            settings_set_str("track_sql_$setting", $value);
+            Irssi::settings_set_str("track_sql_$setting", $value);
             Irssi::print("$setting has been set");
         }
     } elsif ($command eq 'raw') {
-        my $current_status = settings_get_bool('track_raw_enable');
-        settings_set_bool('track_raw_enable', $current_status ? 0 : 1);
+        my $current_status = Irssi::settings_get_bool('track_raw_enable');
+        Irssi::settings_set_bool('track_raw_enable', $current_status ? 0 : 1);
         Irssi::print(
             "Raw mode set to: " . ($current_status ? "%GOFF%N" : "%RON%N"));
     } else {
         Irssi::print('%RUnknown directive passed to \'set\'');
     }
+
+    return $SUCCESS;
 }
 
 sub check_sql_info {
-    ($sql_host, $sql_user, $sql_pass, $sql_port, $sql_table, $sql_db) = (
-        settings_get_str('track_sql_host'),
-        settings_get_str('track_sql_user'),
-        settings_get_str('track_sql_pass'),
-        settings_get_str('track_sql_port'),
-        settings_get_str('track_sql_table'),
-        settings_get_str('track_sql_db'),
-    );
+    my $passed = $ZERO;
 
-    my $passed = 0;
-    Irssi::print('Checking for required SQL information');
+    ($sql_host, $sql_user, $sql_pass, $sql_port, $sql_table, $sql_db) = (
+        Irssi::settings_get_str('track_sql_host'),
+        Irssi::settings_get_str('track_sql_user'),
+        Irssi::settings_get_str('track_sql_pass'),
+        Irssi::settings_get_str('track_sql_port'),
+        Irssi::settings_get_str('track_sql_table'),
+        Irssi::settings_get_str('track_sql_db'),
+    );
 
     if (   length $sql_host > 1
         && length $sql_user > 1
@@ -726,7 +682,6 @@ sub check_sql_info {
         && length $sql_table > 1
         && length $sql_db > 1) {
         $passed = 1;
-        Irssi::print('%GAll required SQL settings found');
     }
 
     return $passed;
@@ -737,14 +692,79 @@ sub get_sql_time {
     return $dt->strftime('%Y-%m-%d %H:%M:%S');
 }
 
+sub file_to_array {
+    my ($file_path, $arr_ref) = @_;
+    my $contents;
+    local $/;
+
+    open my $fh, '<', $file_path
+      or warn "Couldn't open file '$file_path': $OS_ERROR\n";
+
+    $contents = <$fh>;
+    @$arr_ref = split /[\r\n]/, $contents;
+
+    close $fh;
+
+    return $SUCCESS;
+}
+
+sub load_raw {
+    my @temp_entries;
+
+    file_to_array(Irssi::settings_get_str('track_file'), \@temp_entries);
+
+    foreach my $entry (@temp_entries) {
+        chomp $entry;
+        my ($nick, $ident, $host) = split /;/, $entry;
+
+        $DB{$nick}{ident} = $ident;
+        $DB{$nick}{host}  = $host;
+        $DB{count}{raw}++;
+    }
+}
+
+sub load_sql {
+    if (check_sql_info()) {
+        my $sql_table = Irssi::settings_get_str('track_sql_table');
+        my $sth = $dbh->prepare("SELECT * FROM $sql_table");
+        $sth->execute();
+
+        while (my $row_ref = $sth->fetchrow_arrayref) {
+            my ($nick, $ident, $host, $real, $reg, $bot, $dfs,  $dls,   $dr,   $dm,   $uuid) = @$row_ref;
+            $DB{$nick}{real}       = $real;
+            $DB{$nick}{registered} = $reg;
+            $DB{$nick}{bot}        = $bot;
+            $DB{$nick}{date_first} = $dfs;
+            $DB{$nick}{date_last}  = $dls;
+            $DB{$nick}{date_reg}   = $dr;
+            $DB{$nick}{date_mod}   = $dm;
+            $DB{$nick}{uuid}       = $uuid;
+            $DB{count}{sql}++;
+        }
+    }
+}
+
+sub init_db {
+    #    do_backups();
+    load_raw();
+    load_sql();
+
+    Irssi::print(
+        "Initialized the database with %Y" . $DB{count}{raw} .
+        "%N %RRAW%N entries, and %G" . $DB{count}{sql} . "%N %BSQL%N entries"
+    );
+
+    return $SUCCESS;
+}
+
 sub raw_to_sql {
-    open my $fh, '<', settings_get_str('track_file');
+    open my $fh, '<', Irssi::settings_get_str('track_file');
     my @list = <$fh>;
     close $fh;
 
     my $sth = $dbh->prepare(
         "INSERT INTO $sql_table (nickname, ident, hostname, date_first_seen, date_last_seen, real_name, registered, channels, servers, bot, unique_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    ) or warn "Can't prepare statement: $! ($dbh->errstr)";
+    ) or warn "Can't prepare statement: $CHILD_ERROR ($dbh->errstr)";
 
     foreach my $entry (@list) {
         my ($unick, $ident, $host) = split (';', $entry);
@@ -760,8 +780,9 @@ sub raw_to_sql {
             $unick,           $ident,          $host,
             $date_first_seen, $date_last_seen, $real_name,
             $registered,      $channels,       $servers,
-            $bot,             $unique_id,)
-                or warn "Can't execute prepared statement: $! ($dbh->errstr)";
+            $bot,             $unique_id,
+          )
+          or warn "Can't execute prepared statement: $CHILD_ERROR ($dbh->errstr)";
     }
 }
 
@@ -780,21 +801,19 @@ sub process_chans {
             my @result;
 
             if ($temp =~ /(.*?):(.*?):(.*)/) {
-                $unick = $1;
-                $ident = $2;
-                $host  = $3;
+                ($unick, $ident, $host) = ($1, $2, $3);
             }
-            
+
             $unique_data_id = get_unique_id($unick, $ident, $host, $channel);
-            $sth = $dbh->prepare('SELECT `unique_id`,`unique_data_id` FROM track_data WHERE unique_data_id = ?')
-               or croak 'Unable to prepare statement: ' . $dbh->errstr;
+            $sth = $dbh->prepare('SELECT `unique_id`,`unique_data_id` FROM track_data WHERE unique_data_id = ?');
             $sth->execute($unique_data_id);
 
             @result = $sth->fetchrow_array();
-            
+
             if (!$result[0]) {
                 $sth = $dbh->prepare(
-                    'INSERT INTO track_data (server, channel, unique_id, unique_data_id) VALUES (?, ?, ?, ?)');
+                    'INSERT INTO track_data (server, channel, unique_id, unique_data_id) VALUES (?, ?, ?, ?)'
+                );
                 $sth->execute($server_real_address, $channel, $active_uid, $unique_data_id);
             }
         }
@@ -825,8 +844,9 @@ sub notice {
         $unick = $1 if $unick eq 'None';
     }
 
-    if ($message =~ 
-        /Time registered\W*: (\w+) (?<day>\d+)-(?<month>\w+)-(?<year>\d+) (?<hour>\d+):(?<min>\d+):(?<sec>\d+) GMT/xms){
+    if ($message =~
+        /Time registered\W*: (\w+) (?<day>\d+)-(?<month>\w+)-(?<year>\d+) (?<hour>\d+):(?<min>\d+):(?<sec>\d+) GMT/xms
+    ) {
         my $datetime =
             $+{year} . '-'
           . $months{$+{month}} . '-'
@@ -841,7 +861,8 @@ sub notice {
     }
 
     if ($message =~
-        /Last seen time\W*: (\w+) (?<day>\d+)-(?<month>\w+)-(?<year>\d+) (?<hour>\d+):(?<min>\d+):(?<sec>\d+) GMT/xms) {
+        /Last seen time\W*: (\w+) (?<day>\d+)-(?<month>\w+)-(?<year>\d+) (?<hour>\d+):(?<min>\d+):(?<sec>\d+) GMT/xms
+    ) {
         my $datetime =
             $+{year} . '-'
           . $months{$+{month}} . '-'
@@ -849,43 +870,78 @@ sub notice {
           . $+{hour} . ':'
           . $+{min} . ':'
           . $+{sec};
-        my $sth = $dbh->prepare("UPDATE $sql_table SET `date_last_seen` = ? WHERE `nickname` = ?");
+        my $sth = $dbh->prepare(
+            "UPDATE $sql_table SET `date_last_seen` = ? WHERE `nickname` = ?");
         $sth->execute($datetime, $unick);
         $unick = "None";
     }
 }
 
-my $lmao = q/
-%KIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII%N
-%KIIIIIIIIIIIIIIIIIIIIIIII%RNNNN%KII%RN%RNN%RN%KIIIIIIIIIIIIIIIIIIIIIII%N
-%KIIIIIIIIIIIIIIIIIIIIIII%RN%KIIII%RNN%KIIII%RN%KIIIIIIIIIIIIIIIIIIIIII%N
-%KIIIIIIIIIIIIIIIIIIIIIII%RN%KIIIIIIIIII%RN%KIIIIIIIIIIIIIIIIIIIIII%N
-%KIIIIIIIIIIIIIIIIIIIIIII%RN%KIIIIIIIIII%RN%KIIIIIIIIIIIIIIIIIIIIII%N
-%KIIIIIIIIIIIIIIIIIIIIIII%RN%KIIIIIIIIII%RN%KIIIIIIIIIIIIIIIIIIIIII%N
-%KIIIIIIIIIIIIIIIIIIIII%R8888888888888888%KIIIIIIIIIIIIIIIIIIII%N
-%KIIIIIIIIIIIIIIIIIIIIII%B#%RNNNN%RM%KII%RNNNN%RN%B#%KIIIIIIIIIIIIIIIIIIIII%N
-%KIIIIIIIIIIIIIIIIIIIIIII%RN%KII%YI%RM%RN%RN%RN%KII%YI%RN%KIIIIIIIIIIIIIIIIIIIIII%N
-%KIIIIIIIIIIIIIIIIIIIIIII%RNNNNM%KII%RNNNNN%KIIIIIIIIIIIIIIIIIIIIII%N
-%KIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII%N
-%KIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII%B#%KIII%N
-%KIII%B########%KIIIIIIIIIIIIIIIIIIIIII%B#%KIIIIIIIIIIIIIIIIIII%B#%KIII%N
-%KIII%B##%KII%B##%KI%B#%KII%B#%KI%B##%KIII%B####%KIII%B##%KIIII%B#%KIIIIIIIIII%B######%KIII%B#%KIII%N
-%KIIIIIII%B##%KIIII%B##%KI%B#%KI%B##%KII%B#%KIII%B#%KII%B##%KII%B#%KII%B##%KIIIIII%B%B##%N%KIII%B#%KIII%B#%KIII%N
-%KIIIIIII%B#%KIIIII%B#%KIIIIII%B###%KII%B##%KIIIIII%B####%N%KIIIIIII%B%B##%N%KIII%B##%KII%B#%KIII%N
-%KIIIIIII%B#%KIIIII%B#%KIIII%B#%KIII%B#%KII%B##%KIIIIII%B#%KII%B##%KIIIIII%B##%KIII%B#%KIII%B#%KIII%N
-%KIIIII%B#####%KII%B###%B#%KII%B######%KII%B#####%KI%B##%KII%B###%KII%G#%KII%B%B######%KI%B####%KII%N
-%KIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII%B##%KIIIIIIIIIII%N
-%KIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII%B####%KIIIIIIIIII%N
-%KIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII%N/;
+sub help {
+    my $help = <<HELP;
 
-Irssi::print("$lmao");
-Irssi::command_bind('track' => \&track);
+        \%_\%C\%UHelp\%N
 
-Irssi::signal_add('message join',       'joining');
-Irssi::signal_add('message nick',       'nchange');
-Irssi::signal_add('message irc notice', 'notice');
+        \%U/track quiet\%U
+            Toggle quiet. If this is on, it wont show when a person
+            is added or already existing in the database.
 
-Irssi::signal_add_first('event 311', 'whois_signal');
-Irssi::signal_add_last('event 319',     'process_chans');
-Irssi::signal_add_last('setup changed', 'init');
-init();
+        \%U/track <sql|raw> count\%U
+            Print amount of database entries.
+
+        \%U/track import <file>\%U
+            This allows you to import AKA databases. AKA is a popular
+            mIRC script which allows you to keep track of people by
+            nickname and hostmask. This imports all of the nicknames
+            and hosts and fills in the ident with AKAImport, since
+            AKA does not keep track of idents.
+
+        \%U/track search <sql|raw> <\%_ident\%_|\%_nick\%_|\%_host\%_|\%_all\%_> \%I(literal/regex)\%I <input>\%U
+            The first parameter specifies whether or not you want to search
+            the raw database, or the SQL database. You then choose which attribute
+            to parse; alternatively you can search all of them (slow, depending on db size)
+            For your input parameter, string literals or regular expressions can be unused.
+            See below for a better idea at how these work.
+
+        \%U\%_\%CExamples\%N
+            /track search raw host .*(or|pa|tx|fl)..*comcast.*
+            /track search raw host (24|195)[.-](226|185)[-.][0-9]{1,3}[-.][0-9]{1,3}
+                Matches: 195.185.x.x
+                Matches: CPE-x24-185-xxx-xx.y.y.y.net.au
+            /track search raw nick Zi[dptb]+y
+                Matches: Ziddy, Zippy, Zidy, Zitty, Zipty, etc.
+        TODO: XXX: FIXME:  XXXXXXXXXXXXXXXXX ADD SQL EXAMPLES ONCE IMPLEMENTED XXXXXXXXXXXXXXXXXXXXXXX
+HELP
+    
+    Irssi::print($help);
+    return $SUCCESS;
+}
+
+sub track_banner {
+    my $banner = q/
+        %KIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII%N
+        %KIIIIIIIIIIIIIIIIIIIIIIII%RNNNN%KII%RN%RNN%RN%KIIIIIIIIIIIIIIIIIIIIIII%N
+        %KIIIIIIIIIIIIIIIIIIIIIII%RN%KIIII%RNN%KIIII%RN%KIIIIIIIIIIIIIIIIIIIIII%N
+        %KIIIIIIIIIIIIIIIIIIIIIII%RN%KIIIIIIIIII%RN%KIIIIIIIIIIIIIIIIIIIIII%N
+        %KIIIIIIIIIIIIIIIIIIIIIII%RN%KIIIIIIIIII%RN%KIIIIIIIIIIIIIIIIIIIIII%N
+        %KIIIIIIIIIIIIIIIIIIIIIII%RN%KIIIIIIIIII%RN%KIIIIIIIIIIIIIIIIIIIIII%N
+        %KIIIIIIIIIIIIIIIIIIIII%R8888888888888888%KIIIIIIIIIIIIIIIIIIII%N
+        %KIIIIIIIIIIIIIIIIIIIIII%B#%RNNNN%RM%KII%RNNNN%RN%B#%KIIIIIIIIIIIIIIIIIIIII%N
+        %KIIIIIIIIIIIIIIIIIIIIIII%RN%KII%YI%RM%RN%RN%RN%KII%YI%RN%KIIIIIIIIIIIIIIIIIIIIII%N
+        %KIIIIIIIIIIIIIIIIIIIIIII%RNNNNM%KII%RNNNNN%KIIIIIIIIIIIIIIIIIIIIII%N
+        %KIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII%N
+        %KIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII%B#%KIII%N
+        %KIII%B########%KIIIIIIIIIIIIIIIIIIIIII%B#%KIIIIIIIIIIIIIIIIIII%B#%KIII%N
+        %KIII%B##%KII%B##%KI%B#%KII%B#%KI%B##%KIII%B####%KIII%B##%KIIII%B#%KIIIIIIIIII%B######%KIII%B#%KIII%N
+        %KIIIIIII%B##%KIIII%B##%KI%B#%KI%B##%KII%B#%KIII%B#%KII%B##%KII%B#%KII%B##%KIIIIII%B%B##%N%KIII%B#%KIII%B#%KIII%N
+        %KIIIIIII%B#%KIIIII%B#%KIIIIII%B###%KII%B##%KIIIIII%B####%N%KIIIIIII%B%B##%N%KIII%B##%KII%B#%KIII%N
+        %KIIIIIII%B#%KIIIII%B#%KIIII%B#%KIII%B#%KII%B##%KIIIIII%B#%KII%B##%KIIIIII%B##%KIII%B#%KIII%B#%KIII%N
+        %KIIIII%B#####%KII%B###%B#%KII%B######%KII%B#####%KI%B##%KII%B###%KII%G#%KII%B%B######%KI%B####%KII%N
+        %KIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII%B##%KIIIIIIIIIII%N
+        %KIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII%B####%KIIIIIIIIII%N
+        %KIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII%N/;
+
+    Irssi::print($banner);
+
+    return $SUCCESS;
+}
